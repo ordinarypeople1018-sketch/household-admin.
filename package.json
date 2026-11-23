@@ -1,0 +1,13 @@
+{
+  "name": "household-admin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Track bills, renewals and subscriptions in one place.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

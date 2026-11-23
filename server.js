@@ -1,0 +1,377 @@
+'use strict';
+// Household Admin: zero-dependency Node server (Node 18+).
+// Accounts, sessions and per-user items stored in a JSON file.
+// For real production traffic, swap the JSON file for Postgres/SQLite and run behind HTTPS.
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { promisify } = require('util');
+
+const scrypt = promisify(crypto.scrypt);
+
+const PORT = Number(process.env.PORT) || 3000;
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
+// Static files live in ./public, or beside server.js when the project is uploaded flat (no folders).
+const PUBLIC_DIR = fs.existsSync(path.join(__dirname, 'public')) ? path.join(__dirname, 'public') : __dirname;
+const STATIC_FILES = new Set(['index.html', 'styles.css', 'app.js', 'privacy.html']);
+const SECURE_COOKIE = process.env.NODE_ENV === 'production';
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+const SESSION_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_BODY = 50 * 1024;
+const MAX_ITEMS_PER_USER = 500;
+
+const CATEGORIES = ['insurance', 'utilities', 'subscription', 'tax', 'rent', 'loan', 'warranty', 'other'];
+const REPEATS = ['none', 'monthly', 'yearly'];
+
+// ---------- storage ----------
+let db = { users: [], sessions: [], items: [] };
+
+function loadDb() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+}
+
+function saveDb() {
+  const tmp = DB_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(db), { mode: 0o600 });
+  fs.renameSync(tmp, DB_FILE);
+}
+
+// ---------- helpers ----------
+const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const newId = () => crypto.randomBytes(12).toString('hex');
+
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const key = await scrypt(password, salt, 64);
+  return `scrypt$${salt.toString('hex')}$${key.toString('hex')}`;
+}
+
+async function verifyPassword(password, stored) {
+  const [alg, saltHex, keyHex] = String(stored).split('$');
+  if (alg !== 'scrypt') return false;
+  const key = await scrypt(password, Buffer.from(saltHex, 'hex'), 64);
+  const expected = Buffer.from(keyHex, 'hex');
+  return key.length === expected.length && crypto.timingSafeEqual(key, expected);
+}
+
+function parseCookies(header) {
+  const out = {};
+  for (const part of String(header || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > -1) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+
+function clientIp(req) {
+  if (TRUST_PROXY) {
+    const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (fwd) return fwd;
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) {
+        reject(httpError(413, 'Request too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (!chunks.length) return resolve({});
+      try {
+        const v = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        resolve(v && typeof v === 'object' ? v : {});
+      } catch {
+        reject(httpError(400, 'Invalid JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function httpError(status, message) {
+  const e = new Error(message);
+  e.status = status;
+  return e;
+}
+
+const SECURITY_HEADERS = {
+  'Content-Security-Policy':
+    "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'no-referrer',
+  'X-Frame-Options': 'DENY',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+};
+
+function send(res, status, body, extra = {}) {
+  const isObj = typeof body === 'object' && body !== null && !Buffer.isBuffer(body);
+  const payload = isObj ? JSON.stringify(body) : body;
+  res.writeHead(status, {
+    ...SECURITY_HEADERS,
+    'Content-Type': isObj ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...extra,
+  });
+  res.end(payload);
+}
+
+function setSessionCookie(res, token, maxAgeMs) {
+  const parts = [
+    `sid=${token}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${Math.floor(maxAgeMs / 1000)}`,
+  ];
+  if (SECURE_COOKIE) parts.push('Secure');
+  return parts.join('; ');
+}
+
+function createSession(userId) {
+  const token = crypto.randomBytes(32).toString('hex');
+  db.sessions.push({ hash: sha256(token), userId, expires: Date.now() + SESSION_MS });
+  return token;
+}
+
+function currentUser(req) {
+  const token = parseCookies(req.headers.cookie).sid;
+  if (!token) return null;
+  const hash = sha256(token);
+  const now = Date.now();
+  const s = db.sessions.find((x) => x.hash === hash && x.expires > now);
+  return s ? db.users.find((u) => u.id === s.userId) || null : null;
+}
+
+function publicUser(u) {
+  return { id: u.id, name: u.name, email: u.email, createdAt: u.createdAt };
+}
+
+// simple in-memory login/signup throttle
+const attempts = new Map();
+function throttle(key, max = 10, windowMs = 15 * 60 * 1000) {
+  const now = Date.now();
+  const rec = (attempts.get(key) || []).filter((t) => now - t < windowMs);
+  if (rec.length >= max) throw httpError(429, 'Too many attempts. Try again in a few minutes.');
+  rec.push(now);
+  attempts.set(key, rec);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of attempts) if (!v.some((t) => now - t < 15 * 60 * 1000)) attempts.delete(k);
+  db.sessions = db.sessions.filter((s) => s.expires > now);
+}, 10 * 60 * 1000).unref();
+
+// ---------- validation ----------
+const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
+
+function validDate(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const d = new Date(s + 'T00:00:00Z');
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
+function cleanItem(body) {
+  const title = String(body.title || '').trim();
+  if (!title || title.length > 80) throw httpError(400, 'Name is required (max 80 characters).');
+  const category = CATEGORIES.includes(body.category) ? body.category : 'other';
+  const repeat = REPEATS.includes(body.repeat) ? body.repeat : 'none';
+  if (!validDate(body.dueDate)) throw httpError(400, 'Please choose a valid due date.');
+  let amount = null;
+  if (body.amount !== null && body.amount !== undefined && body.amount !== '') {
+    amount = Math.round(Number(body.amount) * 100) / 100;
+    if (!Number.isFinite(amount) || amount < 0 || amount > 10000000) throw httpError(400, 'Amount looks wrong.');
+  }
+  const note = String(body.note || '').trim().slice(0, 200);
+  return { title, category, repeat, dueDate: body.dueDate, amount, note };
+}
+
+function addMonths(dateStr, months) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const total = m - 1 + months;
+  const ny = y + Math.floor(total / 12);
+  const nm = ((total % 12) + 12) % 12;
+  const last = new Date(Date.UTC(ny, nm + 1, 0)).getUTCDate();
+  return new Date(Date.UTC(ny, nm, Math.min(d, last))).toISOString().slice(0, 10);
+}
+
+// ---------- API ----------
+async function handleApi(req, res, url) {
+  const method = req.method;
+  const route = url.pathname;
+
+  if (method !== 'GET' && method !== 'HEAD') {
+    if (req.headers['x-requested-with'] !== 'household-admin') throw httpError(403, 'Bad request');
+  }
+
+  if (route === '/api/signup' && method === 'POST') {
+    const b = await readJson(req);
+    throttle('signup:' + clientIp(req), 10);
+    const name = String(b.name || '').trim().slice(0, 60);
+    const email = String(b.email || '').trim().toLowerCase();
+    const password = String(b.password || '');
+    if (!name) throw httpError(400, 'Please enter your name.');
+    if (!EMAIL_RE.test(email)) throw httpError(400, 'Please enter a valid email.');
+    if (password.length < 8 || password.length > 200) throw httpError(400, 'Password must be at least 8 characters.');
+    if (b.agree !== true) throw httpError(400, 'Please accept the Privacy Policy to create an account.');
+    if (db.users.some((u) => u.email === email)) throw httpError(409, 'An account with this email already exists.');
+    const user = {
+      id: newId(),
+      name,
+      email,
+      passwordHash: await hashPassword(password),
+      createdAt: new Date().toISOString(),
+      privacyAcceptedAt: new Date().toISOString(),
+    };
+    db.users.push(user);
+    const token = createSession(user.id);
+    saveDb();
+    return send(res, 201, { user: publicUser(user) }, { 'Set-Cookie': setSessionCookie(res, token, SESSION_MS) });
+  }
+
+  if (route === '/api/login' && method === 'POST') {
+    const b = await readJson(req);
+    const email = String(b.email || '').trim().toLowerCase();
+    throttle(`login:${clientIp(req)}:${email}`, 10);
+    const user = db.users.find((u) => u.email === email);
+    const ok = user ? await verifyPassword(String(b.password || ''), user.passwordHash) : false;
+    if (!ok) throw httpError(401, 'Email or password is incorrect.');
+    const token = createSession(user.id);
+    saveDb();
+    return send(res, 200, { user: publicUser(user) }, { 'Set-Cookie': setSessionCookie(res, token, SESSION_MS) });
+  }
+
+  if (route === '/api/logout' && method === 'POST') {
+    const token = parseCookies(req.headers.cookie).sid;
+    if (token) {
+      const hash = sha256(token);
+      db.sessions = db.sessions.filter((s) => s.hash !== hash);
+      saveDb();
+    }
+    return send(res, 200, { ok: true }, { 'Set-Cookie': setSessionCookie(res, '', 0) });
+  }
+
+  // everything below needs a logged-in user
+  const user = currentUser(req);
+  if (!user) throw httpError(401, 'Please log in.');
+
+  if (route === '/api/me' && method === 'GET') return send(res, 200, { user: publicUser(user) });
+
+  if (route === '/api/items' && method === 'GET') {
+    return send(res, 200, { items: db.items.filter((i) => i.userId === user.id) });
+  }
+
+  if (route === '/api/items' && method === 'POST') {
+    if (db.items.filter((i) => i.userId === user.id).length >= MAX_ITEMS_PER_USER) {
+      throw httpError(400, 'Item limit reached.');
+    }
+    const item = { id: newId(), userId: user.id, done: false, createdAt: new Date().toISOString(), ...cleanItem(await readJson(req)) };
+    db.items.push(item);
+    saveDb();
+    return send(res, 201, { item });
+  }
+
+  const m = route.match(/^\/api\/items\/([a-f0-9]{24})(\/paid)?$/);
+  if (m) {
+    const item = db.items.find((i) => i.id === m[1] && i.userId === user.id);
+    if (!item) throw httpError(404, 'Not found');
+    if (m[2] && method === 'POST') {
+      if (item.repeat === 'none') item.done = true;
+      else item.dueDate = addMonths(item.dueDate, item.repeat === 'monthly' ? 1 : 12);
+      saveDb();
+      return send(res, 200, { item });
+    }
+    if (!m[2] && method === 'PUT') {
+      Object.assign(item, cleanItem(await readJson(req)));
+      item.done = false;
+      saveDb();
+      return send(res, 200, { item });
+    }
+    if (!m[2] && method === 'DELETE') {
+      db.items = db.items.filter((i) => i !== item);
+      saveDb();
+      return send(res, 200, { ok: true });
+    }
+  }
+
+  if (route === '/api/export' && method === 'GET') {
+    const data = {
+      exportedAt: new Date().toISOString(),
+      account: { ...publicUser(user), privacyAcceptedAt: user.privacyAcceptedAt },
+      items: db.items.filter((i) => i.userId === user.id).map(({ userId, ...rest }) => rest),
+    };
+    return send(res, 200, JSON.stringify(data, null, 2), {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Disposition': 'attachment; filename="household-admin-my-data.json"',
+    });
+  }
+
+  if (route === '/api/account' && method === 'DELETE') {
+    const b = await readJson(req);
+    throttle(`delete:${user.id}`, 5);
+    if (!(await verifyPassword(String(b.password || ''), user.passwordHash))) {
+      throw httpError(401, 'Password is incorrect.');
+    }
+    db.items = db.items.filter((i) => i.userId !== user.id);
+    db.sessions = db.sessions.filter((s) => s.userId !== user.id);
+    db.users = db.users.filter((u) => u.id !== user.id);
+    saveDb();
+    return send(res, 200, { ok: true }, { 'Set-Cookie': setSessionCookie(res, '', 0) });
+  }
+
+  throw httpError(404, 'Not found');
+}
+
+// ---------- static files ----------
+const TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.json': 'application/json; charset=utf-8',
+};
+
+function serveStatic(req, res, url) {
+  let rel = decodeURIComponent(url.pathname);
+  if (rel === '/') rel = '/index.html';
+  if (rel === '/privacy') rel = '/privacy.html';
+  if (!STATIC_FILES.has(rel.slice(1))) return send(res, 404, 'Not found');
+  const file = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (!file.startsWith(PUBLIC_DIR + path.sep)) return send(res, 403, 'Forbidden');
+  fs.readFile(file, (err, buf) => {
+    if (err) return send(res, 404, 'Not found');
+    send(res, 200, buf, { 'Content-Type': TYPES[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+  });
+}
+
+// ---------- server ----------
+loadDb();
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
+    if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method not allowed');
+    serveStatic(req, res, url);
+  } catch (err) {
+    const status = err.status || 500;
+    if (status === 500) console.error(err);
+    if (!res.headersSent) send(res, status, { error: status === 500 ? 'Something went wrong.' : err.message });
+  }
+});
+
+server.listen(PORT, () => console.log(`Household Admin running on http://localhost:${PORT}`));
