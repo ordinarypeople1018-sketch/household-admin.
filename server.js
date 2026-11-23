@@ -186,9 +186,10 @@ setInterval(() => {
 }, 10 * 60 * 1000).unref();
 
 // ---------- email ----------
-async function sendMail(to, subject, text) {
+async function sendMail(to, subject, text, html) {
   if (MAIL_MODE === 'console') {
     console.log(`[mail] to=${to}\nsubject=${subject}\n${text}\n[/mail]`);
+    if (html) console.log(`[html]${html}[/html]`);
     return;
   }
   if (!BREVO_API_KEY || !MAIL_FROM) {
@@ -198,10 +199,36 @@ async function sendMail(to, subject, text) {
   const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ sender: { name: 'Household Admin', email: MAIL_FROM }, to: [{ email: to }], subject, textContent: text }),
+    body: JSON.stringify({ sender: { name: 'Household Admin', email: MAIL_FROM }, to: [{ email: to }], subject, textContent: text, ...(html ? { htmlContent: html } : {}) }),
     signal: AbortSignal.timeout(15000),
   });
   if (!res.ok) console.error('The email provider refused the message. Status:', res.status);
+}
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// Email-safe layout: tables and inline styles only, no images or tracking, so nothing loads from outside.
+function emailHtml({ preheader, heading, paragraphs, button, footer }) {
+  const font = "-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+  const paras = paragraphs.map((t) => `<p style="margin:0 0 16px;font-size:16px;line-height:1.55;color:#1b1f23">${esc(t)}</p>`).join('');
+  const btn = button
+    ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:8px 0 20px"><tr><td bgcolor="#0f6b5c" style="border-radius:12px"><a href="${esc(button.url)}" style="display:inline-block;padding:15px 30px;font-size:16px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:12px">${esc(button.label)}</a></td></tr></table>` +
+      `<p style="margin:0 0 24px;font-size:13px;line-height:1.5;color:#5a6068">Button not working? Copy this link into your browser:<br><span style="word-break:break-all;color:#0f6b5c">${esc(button.url)}</span></p>`
+    : '';
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light only"><title>${esc(heading)}</title></head>
+<body style="margin:0;padding:0;background:#f6f4ef;font-family:${font}">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0">${esc(preheader)}</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="#f6f4ef"><tr><td align="center" style="padding:28px 16px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px">
+<tr><td style="padding:0 0 18px"><table role="presentation" cellpadding="0" cellspacing="0"><tr><td width="38" height="38" bgcolor="#0f6b5c" align="center" style="border-radius:10px;color:#ffffff;font-size:19px;font-weight:700">H</td><td style="padding-left:10px;font-size:18px;font-weight:700;color:#1b1f23">Household Admin</td></tr></table></td></tr>
+<tr><td bgcolor="#ffffff" style="background:#ffffff;border:1px solid #ece8df;border-radius:18px;padding:32px 28px">
+<h1 style="margin:0 0 18px;font-size:24px;line-height:1.25;color:#1b1f23">${esc(heading)}</h1>
+${paras}${btn}
+<p style="margin:0;font-size:13px;line-height:1.5;color:#5a6068">${esc(footer)}</p>
+</td></tr>
+<tr><td align="center" style="padding:18px 8px 0;font-size:12px;line-height:1.5;color:#5a6068">Household Admin keeps your bills and renewals in one place.<br>We never sell or share your personal information.</td></tr>
+</table></td></tr></table></body></html>`;
 }
 
 // ---------- validation ----------
@@ -309,7 +336,14 @@ async function handleApi(req, res, url) {
         sendMail(
           user.email,
           'Reset your Household Admin password',
-          `Hi ${user.name},\n\nSomeone asked to reset the password for your Household Admin account.\n\nChoose a new password here (the link works once, for one hour):\n${BASE_URL}/#reset=${token}\n\nIf this was not you, ignore this email. Your password stays the same.`
+          `Hi ${user.name},\n\nSomeone asked to reset the password for your Household Admin account.\n\nChoose a new password here (the link works once, for one hour):\n${BASE_URL}/#reset=${token}\n\nIf this was not you, ignore this email. Your password stays the same.`,
+          emailHtml({
+            preheader: 'Your reset link works once and expires in one hour.',
+            heading: 'Reset your password',
+            paragraphs: [`Hi ${user.name},`, 'Someone asked to reset the password for your Household Admin account. Tap the button to choose a new one. The link works once and expires in one hour.'],
+            button: { label: 'Choose a new password', url: `${BASE_URL}/#reset=${token}` },
+            footer: 'If this was not you, ignore this email. Your password stays the same.',
+          })
         ).catch(() => console.error('Could not send the reset email.'));
       } else if (user) {
         console.error('BASE_URL is not set, so a reset link cannot be built.');
@@ -337,7 +371,13 @@ async function handleApi(req, res, url) {
     sendMail(
       user.email,
       'Your Household Admin password was changed',
-      `Hi ${user.name},\n\nThe password for your Household Admin account was just changed. If this was you, nothing more to do.\n\nIf it was not you, reset your password again right away using "Forgot password" on the login screen.`
+      `Hi ${user.name},\n\nThe password for your Household Admin account was just changed. If this was you, nothing more to do.\n\nIf it was not you, reset your password again right away using "Forgot password" on the login screen.`,
+      emailHtml({
+        preheader: 'Your Household Admin password was just changed.',
+        heading: 'Your password was changed',
+        paragraphs: [`Hi ${user.name},`, 'The password for your Household Admin account was just changed. If this was you, there is nothing more to do.'],
+        footer: 'If it was not you, tap "Forgot password" on the login screen right away to take back your account.',
+      })
     ).catch(() => console.error('Could not send the password-changed email.'));
     return send(res, 200, { ok: true }, { 'Set-Cookie': setSessionCookie(res, '', 0) });
   }
