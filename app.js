@@ -110,6 +110,8 @@
 
   // ---------- auth ----------
   function renderAuth() {
+    if (state.authMode === 'forgot') return renderForgot();
+    if (state.authMode === 'reset') return renderReset();
     const signup = state.authMode === 'signup';
     const err = h('div', { class: 'error', role: 'alert', hidden: true });
     const submit = h('button', { class: 'btn', type: 'submit' }, signup ? 'Create account' : 'Log in');
@@ -142,6 +144,7 @@
       signup && field('name', 'Your name', { type: 'text', autocomplete: 'name', required: true }),
       field('email', 'Email', { type: 'email', autocomplete: 'email', required: true }),
       field('password', 'Password', { type: 'password', autocomplete: signup ? 'new-password' : 'current-password', required: true }, signup ? 'At least 8 characters.' : null),
+      !signup && h('button', { class: 'linkbtn', type: 'button', onClick: () => { state.authMode = 'forgot'; render(); } }, 'Forgot password?'),
       signup && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'agree' }), h('span', null, 'I have read and agree to the ', h('a', { href: '/privacy.html', target: '_blank', rel: 'noopener' }, 'Privacy Policy'), '.')),
       err,
       submit
@@ -158,6 +161,87 @@
       form,
       h('p', { class: 'muted' }, h('a', { href: '/privacy.html', target: '_blank', rel: 'noopener' }, 'Privacy Policy'))
     );
+  }
+
+  function authShell(title, intro, ...children) {
+    return h(
+      'main',
+      { class: 'content auth' },
+      h('div', { class: 'brand' }, h('span', { class: 'mark' }, icon('logo', 20)), 'Household Admin'),
+      h('div', { class: 'stack-form' }, h('h1', null, title), intro && h('p', { class: 'muted' }, intro)),
+      ...children
+    );
+  }
+
+  function renderForgot() {
+    const err = h('div', { class: 'error', role: 'alert', hidden: true });
+    const done = h('div', { class: 'card', role: 'status', hidden: true }, h('strong', null, 'Check your email'), h('span', { class: 'muted' }, 'If an account exists for that address, we have sent a link to reset your password. It works once, for one hour. Check your spam folder too.'));
+    const submit = h('button', { class: 'btn', type: 'submit' }, 'Send reset link');
+    const form = h(
+      'form',
+      {
+        class: 'stack-form',
+        novalidate: true,
+        onSubmit: async (e) => {
+          e.preventDefault();
+          err.hidden = true;
+          submit.disabled = true;
+          try {
+            await api('POST', '/api/forgot', { email: new FormData(form).get('email') });
+            done.hidden = false;
+          } catch (ex) {
+            err.textContent = ex.message;
+            err.hidden = false;
+          }
+          submit.disabled = false;
+        },
+      },
+      field('email', 'Email', { type: 'email', autocomplete: 'email', required: true }),
+      err,
+      submit
+    );
+    return authShell('Forgot your password?', 'Enter your email and we will send you a link to choose a new one.', form, done, h('button', { class: 'linkbtn', type: 'button', onClick: () => { state.authMode = 'login'; render(); } }, 'Back to log in'));
+  }
+
+  function renderReset() {
+    const err = h('div', { class: 'error', role: 'alert', hidden: true });
+    const submit = h('button', { class: 'btn', type: 'submit' }, 'Save new password');
+    const form = h(
+      'form',
+      {
+        class: 'stack-form',
+        novalidate: true,
+        onSubmit: async (e) => {
+          e.preventDefault();
+          err.hidden = true;
+          const fd = new FormData(form);
+          if (fd.get('password') !== fd.get('confirm')) {
+            err.textContent = 'The two passwords do not match.';
+            err.hidden = false;
+            return;
+          }
+          submit.disabled = true;
+          try {
+            await api('POST', '/api/reset', { token: state.resetToken, password: fd.get('password') });
+            state.resetToken = null;
+            state.user = null;
+            state.items = [];
+            state.authMode = 'login';
+            render();
+            toast('Password changed. Please log in.');
+          } catch (ex) {
+            err.textContent = ex.message;
+            err.hidden = false;
+            submit.disabled = false;
+          }
+        },
+      },
+      field('password', 'New password', { type: 'password', autocomplete: 'new-password', required: true }, 'At least 8 characters.'),
+      field('confirm', 'Repeat new password', { type: 'password', autocomplete: 'new-password', required: true }),
+      err,
+      submit
+    );
+    return authShell('Choose a new password', null, form);
   }
 
   function field(name, label, attrs, hint) {
@@ -381,7 +465,7 @@
   }
 
   function render() {
-    if (!state.user) {
+    if (!state.user || state.authMode === 'reset') {
       root.replaceChildren(renderAuth());
       return;
     }
@@ -390,6 +474,13 @@
   }
 
   (async function boot() {
+    // a password-reset link looks like https://your-site/#reset=<64 hex characters>
+    const m = location.hash.match(/^#reset=([a-f0-9]{64})$/);
+    if (m) {
+      state.resetToken = m[1];
+      state.authMode = 'reset';
+      history.replaceState(null, '', location.pathname); // keep the token out of the address bar and history
+    }
     try {
       state.user = (await api('GET', '/api/me')).user;
       await loadItems();

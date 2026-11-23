@@ -21,7 +21,20 @@ Data is saved in `data/db.json` (created on first run). Back this file up.
 - Home screen with 30-day total and due-soon list, All items, Subscriptions, Account
 - Mark paid (repeating items roll to the next date)
 - Download my data (JSON) and Delete my account, which the Privacy Policy promises
+- Forgot password: emails a one-time link that works for 1 hour; changing the password logs the account out everywhere
 - Privacy Policy at `/privacy.html`
+
+## Password reset email (one-time setup)
+
+Reset emails are sent through Brevo's email API (free plan). Create a Brevo account, verify a sender email address there, and create an API key. Then set:
+
+| Variable | Value |
+| --- | --- |
+| `BREVO_API_KEY` | your Brevo API key |
+| `MAIL_FROM` | the sender email you verified in Brevo |
+| `BASE_URL` | your site address, e.g. `https://household-admin.onrender.com` (Render sets this automatically, so you can usually skip it) |
+
+Without these, the app still runs but no reset emails are sent. For local testing only, `MAIL_MODE=console` prints emails to the terminal instead.
 
 ## Security already in place
 
@@ -41,7 +54,7 @@ Data is saved in `data/db.json` (created on first run). Back this file up.
 
 ## Not built yet
 
-- Password reset and email verification (needs an email service). Until then, a user who forgets their password cannot recover the account.
+- Email verification (confirming a new user owns their email address)
 - Bill scanning from photos
 - Push or email reminders (reminders are visible in the app only)
 

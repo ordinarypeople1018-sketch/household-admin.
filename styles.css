@@ -60,6 +60,7 @@ h2 { font-size: 18px; font-weight: 650; }
 .chip.soon { background: var(--warn-soft); color: var(--warn); }
 .chip.paid { background: var(--accent-soft); color: var(--accent); }
 
+.stack-form > .linkbtn, .content > .linkbtn { align-self: flex-start; }
 .empty { background: var(--card); border: 1px dashed #d8d2c4; border-radius: 20px; padding: 28px 20px; text-align: center; display: flex; flex-direction: column; gap: 12px; align-items: center; }
 
 /* buttons and forms */

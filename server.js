@@ -22,16 +22,26 @@ const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const SESSION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_BODY = 50 * 1024;
 const MAX_ITEMS_PER_USER = 500;
+const HOUR = 60 * 60 * 1000;
+const RESET_MS = HOUR;
+
+// Password-reset email settings. The link in the email is built from BASE_URL, never from the
+// request's Host header (that would let an attacker point reset links at their own site).
+const BASE_URL = (process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || (SECURE_COOKIE ? '' : `http://localhost:${PORT}`)).replace(/\/+$/, '');
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+const MAIL_FROM = process.env.MAIL_FROM || '';
+const MAIL_MODE = process.env.MAIL_MODE || ''; // "console" prints emails to the server log: local testing only
 
 const CATEGORIES = ['insurance', 'utilities', 'subscription', 'tax', 'rent', 'loan', 'warranty', 'other'];
 const REPEATS = ['none', 'monthly', 'yearly'];
 
 // ---------- storage ----------
-let db = { users: [], sessions: [], items: [] };
+let db = { users: [], sessions: [], items: [], resets: [] };
 
 function loadDb() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  db.resets = db.resets || [];
 }
 
 function saveDb() {
@@ -170,9 +180,29 @@ function throttle(key, max = 10, windowMs = 15 * 60 * 1000) {
 }
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of attempts) if (!v.some((t) => now - t < 15 * 60 * 1000)) attempts.delete(k);
+  for (const [k, v] of attempts) if (!v.some((t) => now - t < HOUR)) attempts.delete(k);
   db.sessions = db.sessions.filter((s) => s.expires > now);
+  db.resets = db.resets.filter((r) => r.expires > now);
 }, 10 * 60 * 1000).unref();
+
+// ---------- email ----------
+async function sendMail(to, subject, text) {
+  if (MAIL_MODE === 'console') {
+    console.log(`[mail] to=${to}\nsubject=${subject}\n${text}\n[/mail]`);
+    return;
+  }
+  if (!BREVO_API_KEY || !MAIL_FROM) {
+    console.error('Email is not set up (BREVO_API_KEY or MAIL_FROM is missing). No email was sent.');
+    return;
+  }
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ sender: { name: 'Household Admin', email: MAIL_FROM }, to: [{ email: to }], subject, textContent: text }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) console.error('The email provider refused the message. Status:', res.status);
+}
 
 // ---------- validation ----------
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,}$/;
@@ -263,6 +293,55 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ok: true }, { 'Set-Cookie': setSessionCookie(res, '', 0) });
   }
 
+  if (route === '/api/forgot' && method === 'POST') {
+    const b = await readJson(req);
+    const email = String(b.email || '').trim().toLowerCase();
+    throttle('forgot-ip:' + clientIp(req), 8, HOUR);
+    if (EMAIL_RE.test(email)) {
+      throttle('forgot-email:' + email, 3, HOUR);
+      const user = db.users.find((u) => u.email === email);
+      if (user && BASE_URL) {
+        const token = crypto.randomBytes(32).toString('hex');
+        db.resets = db.resets.filter((r) => r.userId !== user.id);
+        db.resets.push({ hash: sha256(token), userId: user.id, expires: Date.now() + RESET_MS });
+        saveDb();
+        // sent in the background so the response time does not reveal whether the account exists
+        sendMail(
+          user.email,
+          'Reset your Household Admin password',
+          `Hi ${user.name},\n\nSomeone asked to reset the password for your Household Admin account.\n\nChoose a new password here (the link works once, for one hour):\n${BASE_URL}/#reset=${token}\n\nIf this was not you, ignore this email. Your password stays the same.`
+        ).catch(() => console.error('Could not send the reset email.'));
+      } else if (user) {
+        console.error('BASE_URL is not set, so a reset link cannot be built.');
+      }
+    }
+    // same answer whether or not the account exists
+    return send(res, 200, { ok: true });
+  }
+
+  if (route === '/api/reset' && method === 'POST') {
+    const b = await readJson(req);
+    throttle('reset:' + clientIp(req), 10);
+    const token = String(b.token || '');
+    const password = String(b.password || '');
+    if (!/^[a-f0-9]{64}$/.test(token)) throw httpError(400, 'This reset link is not valid.');
+    if (password.length < 8 || password.length > 200) throw httpError(400, 'Password must be at least 8 characters.');
+    const hash = sha256(token);
+    const rec = db.resets.find((r) => r.hash === hash && r.expires > Date.now());
+    const user = rec && db.users.find((u) => u.id === rec.userId);
+    if (!user) throw httpError(400, 'This reset link has expired or was already used. Please request a new one.');
+    user.passwordHash = await hashPassword(password);
+    db.resets = db.resets.filter((r) => r.userId !== user.id);
+    db.sessions = db.sessions.filter((s) => s.userId !== user.id); // log out everywhere
+    saveDb();
+    sendMail(
+      user.email,
+      'Your Household Admin password was changed',
+      `Hi ${user.name},\n\nThe password for your Household Admin account was just changed. If this was you, nothing more to do.\n\nIf it was not you, reset your password again right away using "Forgot password" on the login screen.`
+    ).catch(() => console.error('Could not send the password-changed email.'));
+    return send(res, 200, { ok: true }, { 'Set-Cookie': setSessionCookie(res, '', 0) });
+  }
+
   // everything below needs a logged-in user
   const user = currentUser(req);
   if (!user) throw httpError(401, 'Please log in.');
@@ -326,6 +405,7 @@ async function handleApi(req, res, url) {
     }
     db.items = db.items.filter((i) => i.userId !== user.id);
     db.sessions = db.sessions.filter((s) => s.userId !== user.id);
+    db.resets = db.resets.filter((r) => r.userId !== user.id);
     db.users = db.users.filter((u) => u.id !== user.id);
     saveDb();
     return send(res, 200, { ok: true }, { 'Set-Cookie': setSessionCookie(res, '', 0) });
